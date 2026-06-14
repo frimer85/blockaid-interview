@@ -1,0 +1,18 @@
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Build / deps (for when implementation lands)
+node_modules/
+dist/
+bin/
+*.log
+
+# Secrets / local config — never commit
+*.env
+.env*
+*.pem
+*.key
+kubeconfig*
