@@ -31,13 +31,13 @@
 
 ### 1.1 Functional
 
-| # | Requirement | Explicit in assignment? |
-|---|---|---|
-| F1 | Accept incoming purchase requests from users. | ✅ explicit ("receives purchase requests"). The transport (HTTP/REST) is **our assumption** — see §1.3. |
-| F2 | Publish each purchase as an event to an asynchronous event stream. | ✅ explicit |
-| F3 | Consume, validate, and persist purchase events. | ✅ explicit |
-| F4 | Return all purchases for a given user. | ✅ explicit |
-| F5 | Persist at minimum: user identifier, username, price, timestamp. | ✅ explicit |
+| # | Requirement |
+|---|---|
+| F1 | Accept incoming purchase requests from users (over HTTP/REST — see §1.3). |
+| F2 | Publish each purchase as an event to an asynchronous event stream. |
+| F3 | Consume, validate, and persist purchase events. |
+| F4 | Return all purchases for a given user. |
+| F5 | Persist at minimum: user identifier, username, price, timestamp. |
 
 ### 1.2 Non-functional
 
@@ -76,7 +76,7 @@
 ```mermaid
 flowchart LR
   U["Users / Clients"]
-  NLB["AWS NLB (1 per region)<br/>ENI per AZ · cross-zone OFF"]
+  NLB["AWS NLB<br/>ENI per AZ · cross-zone OFF"]
   GW["Customer Gateway<br/>stateless · HPA"]
   K["Kafka topic: purchases<br/>RF=3 · key = user_id · rack-aware"]
   EP["Event Processing Service<br/>consumer group · KEDA on lag"]
@@ -91,22 +91,30 @@ flowchart LR
   DBP -. streaming replication .-> DBR
 ```
 
-**Edge / load balancing.** A **single** internet-facing AWS **NLB** (Network Load
-Balancer) per region, provisioned by the **AWS Load Balancer Controller** running in the
-cluster. It is one logical load balancer with a network interface (ENI) **in each AZ's
-subnet** for AZ redundancy — *not* three separate NLBs. **Cross-zone load balancing is left
-OFF** (the NLB default): each AZ's LB node forwards only to gateway pods in the **same AZ**,
-which keeps the edge hop AZ-local (cost, §7) and is safe because topology spread guarantees
-healthy gateway pods in every AZ. A separate in-cluster **ingress controller** (e.g.,
-NGINX) is *optional* and only worth adding if we later host several services behind one
-entrypoint; for a single API the path **NLB → Gateway Service** is sufficient.
+**Load balancing (the client entry point).** A **single** internet-facing AWS **NLB**
+(Network Load Balancer), provisioned by the **AWS Load Balancer Controller** running in the
+cluster, is the entry point for client traffic. It has a network interface (ENI) **in each
+AZ's subnet** for AZ redundancy. **Cross-zone load balancing is left OFF** (the NLB
+default): each AZ's LB node forwards only to gateway pods in the **same AZ**, keeping the
+client→gateway hop AZ-local (cost, §7) — safe because topology spread guarantees healthy
+gateway pods in every AZ.
+
+We deploy a **single region**: the assignment requires multi-AZ resilience, not
+multi-region, so one regional NLB is sufficient. Multi-region (a second cluster + global
+routing) would only be added for disaster recovery or geo-latency — out of scope, noted in
+§17.
+
+A **Layer-7 ingress** (an NGINX ingress controller or an ALB) isn't needed for a single API;
+we'd add one only if we later fronted several services behind one entrypoint.
 
 **Write path (async, F1–F3, F5):** `Client → Gateway → Kafka (purchases) → Processor →
 Postgres`. The gateway returns `202 Accepted` as soon as the event is durably written to
 Kafka. The stream absorbs bursts and decouples ingest rate from DB write rate.
 
-**Read path (sync, F4):** `Client → Gateway → Postgres read replica`. Reads are served from
-a same-AZ read replica to keep them off the primary and minimize cross-AZ traffic.
+**Read path (sync, F4):** `Client → Gateway → Postgres read replica`. The gateway connects
+to the **read-only Service that the CloudNativePG operator provisions** (it targets the
+replicas, not the primary), and **Topology Aware Routing** (§7) steers the connection to the
+**same-AZ** replica — keeping reads off the primary and AZ-local.
 
 **Why event-driven** (vs. the gateway writing straight to the DB): it buffers spiky
 purchase traffic, decouples ingest from persistence, lets the two sides scale
@@ -124,7 +132,7 @@ independently, and gives us a replayable log for reprocessing and debugging.
 - **Statelessness:** fully stateless → trivially horizontally scalable and a clean HPA
   target.
 - **Idempotent producer.** The gateway's Kafka **producer client** (the Kafka SDK inside
-  the gateway process — *not* a topic/server setting) is configured with:
+  the gateway process) is configured with:
   - `enable.idempotence=true` — the producer tags each record with a sequence number so the
     broker **deduplicates retries**; a network retry can't create a duplicate event.
   - `acks=all` — the producer waits until **all in-sync replicas** have the record before
@@ -135,17 +143,23 @@ independently, and gives us a replayable log for reprocessing and debugging.
 ### 3.2 Event Stream — Apache Kafka (via Strimzi)
 
 **Decision: self-hosted Apache Kafka on EKS, managed by the Strimzi operator (KRaft mode,
-no ZooKeeper).** Kafka is chosen on its functional merits, all of which the assignment
-rewards:
+no ZooKeeper).** Kafka is chosen for the requirements it answers:
 
-- **Per-user ordering** via partitioning on `user_id` (Kafka guarantees order *within* a
-  partition; same key → same partition → same user's events stay ordered).
-- **Replay & durability** — the retained log lets us reprocess after a bug or rebuild the
-  read store; a plain queue deletes on consume.
-- **Consumer-lag autoscaling** — partition lag is a precise, first-class scaling signal for
-  the processor (KEDA, §9).
-- **Runs on Kubernetes** — Strimzi makes Kafka a native, operator-managed K8s workload,
-  satisfying N1 and demonstrating operating a stateful distributed system on K8s.
+- **Per-user ordering** (the §1.3 ordering assumption) via partitioning on `user_id` (Kafka
+  guarantees order *within* a partition; same key → same partition → same user's events stay
+  ordered).
+- **Replay & durability** (supports F3 + debuggability) — the retained log lets us reprocess
+  after a bug or rebuild the read store; a plain queue deletes on consume.
+- **Consumer-lag autoscaling** (N6) — partition lag is a precise, first-class scaling signal
+  for the processor (KEDA, §9).
+- **Runs on Kubernetes** (N1) — Strimzi makes Kafka a native, operator-managed K8s workload.
+
+**Why Kafka over other K8s-native options.** NATS JetStream is lighter to run, but its
+stream/consumer model is a weaker fit for partition-keyed per-user ordering and it lacks
+Kafka's mature lag-based autoscaling (KEDA) and replay ecosystem. RabbitMQ is queue-oriented
+(strong routing, but no ordered, replayable partitioned log). Kafka's partitioned log is the
+best match for ordered-per-user + replay + lag-autoscaling, and Strimzi keeps it
+operationally manageable on K8s.
 
 **Topic `purchases`:** `replication factor = 3`, `min.insync.replicas = 2`, `acks=all`,
 rack-aware replica placement (`broker.rack` = AZ), retention 7 days (replay window).
@@ -155,7 +169,11 @@ parallelism: the **maximum number of actively-consuming pods in a consumer group
 partition count** (extra pods sit idle). 12 is a deliberate starting point — it is **divisible
 by 3** (even spread across AZs) and by common consumer counts (2, 3, 4, 6, 12), giving
 headroom to scale the processor up to 12 pods without repartitioning, while staying small
-enough to keep per-broker metadata/overhead low.
+enough to keep per-broker overhead low. *(Every partition costs the broker resources: it
+holds per-partition leader/replica state and an in-memory index in memory, open file handles
+and log-segment files on disk, and a replication fetcher per follower. Tens of thousands of
+partitions per broker inflate memory and file descriptors and slow leader election during
+failover — so we keep the count modest.)*
 
 Scaling partitions later is possible but **sensitive**, so we capacity-plan up front:
 - You can **increase** partitions online (`kafka-topics --alter --partitions N`) but **never
@@ -165,8 +183,18 @@ Scaling partitions later is possible but **sensitive**, so we capacity-plan up f
   the new partition while older events remain in the old one → the **per-user ordering
   guarantee breaks across the change boundary**, and briefly two consumers can handle the
   same user.
-- Therefore: over-provision partitions modestly at creation (what we do here), or, if a big
-  jump is ever needed, migrate to a new topic — rather than reshuffle a live one.
+- Therefore: over-provision partitions modestly at creation (what we do here). If a large
+  increase is ever truly needed, **migrate to a new topic** instead of reshuffling a live
+  one:
+  1. Create `purchases.v2` with the higher partition count.
+  2. Switch producers to `v2` (optionally dual-publish briefly).
+  3. Let consumers drain `v1` to completion, then move the consumer group to `v2`.
+  4. Decommission `v1` after retention expires.
+
+  **Cost:** transient operational complexity and a cutover window in which ordering must be
+  protected — drain `v1` for a given user before `v2` takes over for that user, so their
+  events aren't processed out of order across the boundary. It's a planned migration, not a
+  hot operation, which is exactly why we provision enough partitions up front.
 
 ### 3.3 Event Processing Service
 
@@ -188,12 +216,22 @@ uniform, but the *access patterns* favor relational:
 - F4 ("all purchases for a user, newest-first, paginated") plus very likely future needs
   (aggregations, reporting, time-range queries, "spend per user/period") are exactly what
   SQL + secondary indexes do well.
-- Purchases are financial-adjacent, so we want **ACID transactions**, strong consistency,
-  and `NUMERIC` money handling.
+- Purchases are financial-adjacent, so we want **ACID** (Atomicity, Consistency, Isolation,
+  Durability) **transactions**, strong consistency, and `NUMERIC` money handling.
 - A key-value/document store (e.g., DynamoDB with partition key `user_id`) would serve the
-  literal "by user_id" lookup and scales writes more easily, but trades away ad-hoc
-  querying, joins, and transactional richness. It becomes attractive only if **write
-  throughput** outgrows a single primary — captured as future work (§17, sharding).
+  literal "by user_id" lookup and scales writes more easily, but trades away three things we
+  value:
+  - **Ad-hoc querying** — running arbitrary filters/aggregations we didn't plan for up front
+    (e.g., "total spend per user last month"); SQL does this natively, whereas a KV store
+    forces you to precompute or full-scan.
+  - **Joins** — answering a query by combining rows from multiple tables in one statement
+    (e.g., purchases × users × products). KV stores have no joins, so you denormalize the
+    data or issue many separate lookups in application code.
+  - **Transactional richness** — updating several rows atomically and with isolation
+    (multi-statement ACID transactions), rather than only per-key writes.
+
+  A KV store becomes attractive only if **write throughput** outgrows a single primary —
+  captured as future work (§17, sharding).
 
 **Why PostgreSQL (vs. MySQL).** Both are solid; Postgres is preferred for:
 - **Mature K8s operators** (CloudNativePG, Zalando) with robust automated failover, backups
@@ -279,22 +317,11 @@ CREATE INDEX idx_purchases_user_time ON purchases (user_id, purchased_at DESC);
 
 - **Delivery: at-least-once.** Kafka + offset-after-commit can redeliver on failure. We make
   this safe with **idempotent upserts** (`ON CONFLICT (event_id) DO NOTHING`).
-- **Why not exactly-once.** Two common ways to get closer to exactly-once, and why we skip
-  both:
-  - **Transactional outbox** — to avoid the "dual-write" problem (writing to the DB and
-    publishing to Kafka as two separate steps, where one can succeed and the other fail),
-    you write the business row **and** an `outbox` row in the **same DB transaction**, then a
-    separate relay (e.g., Debezium change-data-capture) reads the outbox and publishes to
-    Kafka. The event is published **iff** the transaction committed.
-  - **Kafka EOS (Exactly-Once Semantics)** — Kafka's transactional producer API lets a
-    *consume→process→produce* cycle commit input offsets and output records **atomically**,
-    so each input is processed exactly once **within Kafka**. But our sink is an **external**
-    database; Kafka transactions don't extend to Postgres, so true end-to-end exactly-once
-    would still need the outbox pattern or a transactional sink connector.
-  - We skip both because **idempotent upserts already produce the same end state** with far
-    less moving machinery.
-- **Producer idempotence** (`enable.idempotence=true`, a **producer-client** config, not a
-  topic config — see §3.1) prevents duplicate events from producer retries.
+- **Why not exactly-once.** True end-to-end exactly-once across Kafka and an external
+  database needs significant extra machinery and yields **the same end state** that
+  idempotent upserts already give us — so we deliberately skip it.
+- **Producer idempotence** (`enable.idempotence=true`, see §3.1) prevents duplicate events
+  from producer retries.
 - **Consistency model: read-your-writes is _not_ guaranteed.** Because persistence is
   asynchronous, a `GET` immediately after a `POST` may not show the purchase yet. Trade-off
   accepted for burst absorption and decoupling. Mitigations:
@@ -327,8 +354,8 @@ cascading restarts:
 | **liveness** (`/healthz`) | is the process responsive / event loop alive? | **restart** the container |
 | **readiness** (`/readyz`) | are dependencies reachable (Kafka producer / assigned partitions + DB)? | **remove from Service endpoints** (stop sending traffic) but don't restart |
 
-> **Startup probe** (the one you asked about): a probe that runs **only during initial
-> startup**. While it is still failing, the liveness and readiness probes are **disabled**.
+> **Startup probe:** a probe that runs **only during initial startup**. While it is still
+> failing, the liveness and readiness probes are **disabled**.
 > Once it succeeds once, Kubernetes hands over to liveness/readiness. Its job is to protect
 > **slow-starting** containers (e.g., a consumer joining a group, JVM warmup) from being
 > killed by an aggressive liveness probe before they've finished booting.
@@ -348,10 +375,12 @@ validated by load test** (k6), then refined — they are not guesses left vague:
 | Kafka broker | 1 | 1 | 4Gi | 4Gi | Guaranteed |
 | Postgres | 1 | 1 | 4Gi | 4Gi | Guaranteed |
 
-Concrete guidance instead of "set requests honestly":
+Guidance:
 - **CPU request = observed steady-state usage** under representative load (≈ p50–p75 of
   measured CPU), *not* an aspirational low (causes overcommit + noisy neighbors) and *not*
-  peak (wastes capacity, hurts bin-packing).
+  peak. Over-sized requests hurt **bin-packing** — the scheduler reserves a node's capacity
+  by each pod's *requests*, so inflated requests fit fewer pods per node and force more
+  (costlier) nodes even when actual usage is low.
 - **Omit CPU limits** on latency-sensitive app pods to avoid CFS throttling; if a limit is
   required by policy, set it generously.
 - **Memory request == limit** on each container so stateful pods land in the **Guaranteed**
@@ -404,13 +433,19 @@ routing — same-AZ and off the primary.
 **4. Kafka consumer reads → rack-aware fetch (KIP-392).** Set `broker.rack` = AZ and enable
 `RackAwareReplicaSelector`. Consumers then fetch from a **same-AZ follower replica** instead
 of always hitting the (possibly remote) partition leader — eliminating cross-AZ **consume**
-traffic, typically the dominant variable cost.
+traffic, typically the dominant variable cost. *(KIP-392 — "Kafka Improvement Proposal" 392,
+"Allow consumers to fetch from the closest replica" — is the Kafka feature that makes reading
+from a same-rack/same-AZ follower possible; before it, consumers could only read from the
+leader.)*
 
 **Accepted (irreducible) cross-AZ hops:**
 - **Kafka replication (RF=3, one replica per AZ):** mandatory to survive an AZ loss (N3);
   crosses AZs by definition. A durability cost we accept.
 - **Producer→leader & processor→primary writes:** must reach the single leader/primary, so
-  ~2/3 of pods write cross-AZ. Bounded, and far smaller than read/consume fan-out.
+  ~2/3 of pods write cross-AZ. This stays bounded because a purchase is **written once** but
+  **read many times** — every consumer poll plus every user `GET` re-reads data — so
+  read/consume bytes generally dominate write bytes. That asymmetry is why we invest in
+  making reads same-AZ (layers 3–4) and simply accept the smaller write hop.
 
 **Net:** cross-AZ spend is reduced to the durability-required minimum while all high-volume
 read/consume traffic stays same-AZ. We confirm this holds under real traffic by monitoring
@@ -438,7 +473,7 @@ node), survivors still serve peak.
 |---|---|---|
 | Brokers | **6 brokers, 2 per AZ**; partitions RF=3 with **one replica per AZ** (rack-aware) | Lose 1 AZ (−2 brokers) → each partition keeps 2 in-sync replicas in the other AZs; `min.insync.replicas=2` still writable. Lose 1 more node → that AZ still has its 2nd broker holding the replica → still ≥2 ISR. ✅ |
 | Durability | `acks=all`, `min.insync.replicas=2` | A write is acked only once it's on ≥2 AZs → an AZ loss can't lose acked data. |
-| Control plane (KRaft) | dedicated controller quorum | **Nuance, stated honestly:** a 3-controller quorum tolerates 1 failure. To strictly survive AZ+node concurrently, run **5 controllers** with zone spread so the metadata quorum keeps a majority through the worst case, and validate placement. |
+| Control plane (KRaft) | dedicated controller quorum | **Subtle point:** a 3-controller quorum tolerates only **1** failure, so a concurrent AZ+node loss can break it if the lost AZ happens to hold 2 of the 3 controllers. To strictly survive AZ+node, run **5 controllers** spread across AZs so the metadata quorum keeps a majority through the worst case, and validate placement. |
 
 > **ISR = In-Sync Replicas:** the set of replicas (leader + followers) fully caught up with
 > the leader. With `acks=all` + `min.insync.replicas=2`, a produce succeeds only while ≥2
@@ -447,8 +482,8 @@ node), survivors still serve peak.
 
 ### 8.3 PostgreSQL
 
-This is where the naive design breaks, and it's worth being precise (you flagged exactly
-this): **synchronous commit cannot be honored if no standby survives.**
+This is where the naive design breaks, and it's worth being precise: **synchronous commit
+cannot be honored if no standby survives.**
 
 - **Placement & sizing.** Instances spread across 3 AZs via topology spread. With *N*
   instances, one AZ holds ⌈N/3⌉, so the worst-case AZ+node loss removes ⌈N/3⌉ + 1 instances.
@@ -462,9 +497,9 @@ this): **synchronous commit cannot be honored if no standby survives.**
 - **Synchronous commit quorum `ANY 1`.** A commit normally waits for acknowledgement from at
   least one standby in another AZ, so a failover never loses an acked transaction — without
   paying full all-replica latency.
-- **What happens in your scenario (lose the AZ holding primary + a replica, plus a node
-  holding another replica, leaving a single instance).** Strict synchronous commit would
-  have **nothing to wait for** and writes would **block** — preserving durability but
+- **The worst case (lose the AZ holding the primary + a replica, plus a node holding another
+  replica, leaving a single surviving instance).** Strict synchronous commit would have
+  **nothing to wait for** and writes would **block** — preserving durability but
   sacrificing availability. To honor "**remain operational**", CloudNativePG is configured to
   **fall back to local/async commit when the synchronous standby count can't be met**: the
   surviving instance is promoted and **keeps serving writes**, accepting a **bounded,
@@ -565,14 +600,14 @@ single trace spans the broker. *(**W3C Trace Context** is the web standard `trac
 `tracestate` headers for carrying a distributed-trace ID across service boundaries; without
 propagating it, the trace would break at the queue.)*
 
-**Alerting + runbooks (you asked what to do on an alert).** Every alert links to a short
-**runbook** with diagnosis → mitigation, stored in-repo (`docs/runbooks/`). Examples:
+**Alerting + runbooks.** Every alert links to a short **runbook** with diagnosis →
+mitigation, stored in-repo (`docs/runbooks/`). Examples:
 
 | Alert | First checks | Mitigation |
 |---|---|---|
 | Consumer lag high (N min) | processor pod health; DB write latency; partition skew | let KEDA scale; if DB-bound, check Postgres; inspect dead-letter topic for poison events |
-| End-to-end lag p99 > SLO | same as above + Kafka under-replication | as above; communicate freshness if sustained |
-| Under-replicated partitions > 0 | broker health / disk; network | restart/replace broker; verify rack placement; ensure ISR recovers |
+| End-to-end lag p99 > SLO | same as above + Kafka under-replication | as above; if sustained, tell stakeholders that recently-submitted purchases may be slow to appear (set expectations / status page) |
+| Under-replicated partitions > 0 | broker health / disk; network | Strimzi auto-recovers a restarted/replaced broker pod and ISR catches up on its own; intervene manually only for disk-full or hardware (expand volume / replace node) |
 | Gateway 5xx rate | recent deploy; Kafka producer / DB reachability | roll back deploy; check dependencies; readiness should already shed traffic |
 | Postgres replication lag | replica load; long transactions; disk | throttle readers; investigate slow queries; consider failover if a replica is stuck |
 
@@ -598,7 +633,7 @@ sizing/retention, HA, upgrades, and access control. Two placements, with the tra
   clusters and fall back to **IRSA** (IAM Roles for Service Accounts) only where a dependency
   hasn't adopted Pod Identity yet. Either way: scoped per-workload roles, **no static keys**.
 - **Pod hardening → enforce the Pod Security Admission `restricted` profile** at the
-  namespace level (PSP is removed since K8s 1.25). The `restricted` profile **subsumes**
+  namespace level. The `restricted` profile **subsumes**
   run-as-non-root, no privilege escalation, dropped Linux capabilities, `seccomp:
   RuntimeDefault`, and read-only-root-filesystem-friendly settings — i.e., we get the full
   hardened baseline rather than a few ad-hoc flags. Stateful workloads (Kafka/Postgres) get
@@ -621,9 +656,7 @@ sizing/retention, HA, upgrades, and access control. Two placements, with the tra
 - **Supply chain — dependencies on PRs, not just images.** Two layers:
   - **On every PR:** scan dependency lockfiles with **OSV-Scanner** (Google, backed by
     OSV.dev) and **block merge** on known-vulnerable packages; add **dependency review** /
-    an allowlist, and **Renovate/Dependabot** for controlled updates. *(OSV-Scanner is the
-    chosen scanner — note the maintainers' own preference to avoid relying on a single
-    ecosystem's tooling.)*
+    an allowlist, and **Renovate/Dependabot** for controlled updates.
   - **On images:** SBOM generation + scan, **pinned image digests** — referencing an image
     by its immutable content hash (`image@sha256:…`) instead of a mutable tag (`:latest`,
     `:v1`), so we deploy the exact bytes we built and scanned and a tag can't be swapped under
@@ -759,4 +792,6 @@ labels and the NLB.
   the metadata quorum keeps a majority through an AZ+node loss.)*
 - **Progressive delivery** (Argo Rollouts / Flagger canary) wired into the CD pipeline (§12).
 - **Service mesh (Linkerd)** for uniform east-west mTLS without app changes (§11).
+- **Multi-region** (a second cluster + global routing, e.g., Route 53 / Global Accelerator)
+  for disaster recovery or geo-latency — beyond the assignment's multi-AZ scope (§2).
 ```
