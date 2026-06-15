@@ -1,4 +1,4 @@
-# ADR-0003 — Cross-AZ data-transfer cost minimization
+# ADR-0001 — Cross-AZ data-transfer cost minimization
 
 - **Status:** Accepted
 - **Date:** 2026-06-15
@@ -15,10 +15,17 @@ stay same-AZ *except where correctness forbids it*.
 
 ## Decision
 
-Apply locality at three layers, and explicitly accept the two cross-AZ hops that are
+Apply locality at four layers, and explicitly accept the two cross-AZ hops that are
 required for correctness.
 
-### 1. Synchronous service-to-service hops → Topology Aware Routing
+### 1. Edge → NLB cross-zone load balancing OFF
+
+- The single regional NLB (one ENI per AZ subnet) is left with **cross-zone load balancing
+  disabled** (its default). Each AZ's LB node forwards only to **same-AZ** gateway pods, so
+  the client→gateway hop never crosses an AZ. Safe because topology spread keeps healthy
+  gateway pods in every AZ.
+
+### 2. Synchronous service-to-service hops → Topology Aware Routing
 
 - Set `Service.spec.trafficDistribution: PreferClose` (K8s ≥1.31; older clusters use the
   `service.kubernetes.io/topology-mode: Auto` annotation). EndpointSlice hints then steer
@@ -26,12 +33,12 @@ required for correctness.
 - Applies to: client→gateway, gateway→Postgres **read replica**, processor→Kafka broker,
   processor→Postgres.
 
-### 2. Read path locality → one Postgres read replica per AZ
+### 3. Read path locality → one Postgres read replica per AZ
 
 - The gateway's read queries (F4) resolve to the **local-AZ replica** via topology-aware
   routing → reads, the highest-volume query traffic, stay same-AZ and off the primary.
 
-### 3. Kafka consumer reads → rack-aware fetch-from-closest-replica (KIP-392)
+### 4. Kafka consumer reads → rack-aware fetch-from-closest-replica (KIP-392)
 
 - Set `broker.rack` = AZ and enable `RackAwareReplicaSelector`. Consumers fetch from a
   **same-AZ follower replica** instead of always hitting the (possibly remote) leader →
@@ -44,12 +51,6 @@ required for correctness.
 - **Producer→leader writes & processor→primary writes:** must reach the single leader/
   primary; ~2/3 of pods will be cross-AZ for writes. Bounded and far smaller than read
   fan-out.
-
-## Note on managed alternatives
-
-A managed regional queue (SQS) would make the messaging hop cross-AZ-free outright (see
-[ADR-0001](0001-messaging-kafka-vs-sqs.md)) — we chose Kafka on functional grounds and
-therefore *engineer* the locality above instead of getting it for free.
 
 ## Consequences
 
