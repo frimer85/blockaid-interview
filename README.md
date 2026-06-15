@@ -4,17 +4,9 @@ An event-driven system that ingests user **purchase events**, persists them, and
 per-user purchase history — designed to run on **AWS EKS** with reliability, scalability,
 and operational maturity.
 
-## What this repository is (and isn't)
-
-This is a **technical design deliverable**, not a running implementation.
-
-The take-home is scoped at ~3 days of build work. I made a deliberate, communicated
-decision to invest in the **design and decision-making** — the part every evaluation
-criterion actually turns on (system design, Kubernetes decisions, resilience/scalability
-reasoning, observability, and clarity of trade-offs) — and to **time-box it to ~2 hours**
-rather than produce a rushed full implementation. The design is written to be
-implementation-ready: specific operators, manifests, metrics, and pipeline stages are named
-throughout.
+This is a **technical design deliverable** — architecture and decision-making, written to be
+implementation-ready (specific operators, manifests, metrics, and pipeline stages are named
+throughout).
 
 ## Start here
 
